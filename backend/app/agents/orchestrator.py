@@ -190,7 +190,8 @@ async def run_generation(
             f"## Source Content\n{combined_content}\n\n"
             f"Use your tools (structure_content, format_table, highlight_code"
             f"{', build_diagram' if request.enable_diagrams else ''}) "
-            f"to build each section. Call generate_toc at the end."
+            f"to build each section. Call generate_toc at the end.\n\n"
+            f"CRITICAL INSTRUCTION: Your final output MUST be the complete, assembled HTML document (including all generated sections and the TOC) concatenated together. Do not output conversational text or markdown code blocks, just the raw HTML."
         )
 
         await send_progress(
@@ -204,8 +205,9 @@ async def run_generation(
             tools.append(build_diagram)
 
         config = LocalAgentConfig(
+            model="gemini-3.1-pro",
             api_key=settings.GEMINI_API_KEY,
-            system_instructions=SYSTEM_INSTRUCTIONS,
+            system_instructions=SYSTEM_INSTRUCTIONS + "\n10. Take a deep breath and think step-by-step. Use your reasoning capabilities to carefully plan the document structure before finalizing the output.",
             tools=tools,
             capabilities=CapabilitiesConfig(
                 enable_subagents=True,
@@ -261,14 +263,24 @@ async def run_generation(
             "Rendering HTML", "Applying theme and building final document..."
         )
 
+        # Clean up markdown code blocks if the LLM wrapped the output
+        final_body = full_response.strip()
+        if final_body.startswith("```"):
+            lines = final_body.split("\n")
+            if lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].startswith("```"):
+                lines = lines[:-1]
+            final_body = "\n".join(lines)
+
         doc = GeneratedDocument(
             task_id=task_id,
             title=request.title,
             theme=request.theme,
-            full_html=full_response,
-            word_count=len(full_response.split()),
-            diagram_count=full_response.count("mermaid"),
-            section_count=full_response.count("<section"),
+            full_html=final_body,
+            word_count=len(final_body.split()),
+            diagram_count=final_body.count("mermaid"),
+            section_count=final_body.count("<section"),
         )
 
         final_html = render_document(doc)
