@@ -1,7 +1,9 @@
-"""DocuForge Orchestrator — main AI agent powered by Google Antigravity SDK.
+"""DocuForge orchestrator — runs a Gemini agent via the unified `google-genai`
+SDK with automatic function calling against the documentation tools.
 
-This module manages the lifecycle of the documentation generation agent,
-including initialization, file ingestion, and streaming generation.
+Auth is handled by :mod:`app.services.llm_client`, which transparently uses
+either an API key (Gemini Developer API) or a GCP service-account JSON
+(Vertex AI).
 """
 
 from __future__ import annotations
@@ -10,12 +12,20 @@ import asyncio
 import json
 from typing import AsyncGenerator
 
-from google.antigravity import Agent, LocalAgentConfig
-from google.antigravity.types import CapabilitiesConfig
+from google.genai import types
 
+from app.agents.tool_context import TaskContext, reset_context, set_context
 from app.agents.tools.code_highlighter import highlight_code
 from app.agents.tools.content_structurer import generate_toc, structure_content
 from app.agents.tools.diagram_builder import build_diagram
+from app.agents.tools.rich_primitives import (
+    build_callout,
+    build_decision_tree,
+    build_formula_block,
+    build_principle,
+    build_signal_card,
+    build_tag,
+)
 from app.agents.tools.table_formatter import format_table
 from app.config import settings
 from app.models.schemas import (
@@ -26,49 +36,120 @@ from app.models.schemas import (
     ImagePlacementInfo,
 )
 from app.services.file_processor import ProcessedFile
-from app.services.html_renderer import render_document
+from app.services.html_renderer import render_document, save_document
+from app.services.llm_client import build_client
 
 
 # ---------------------------------------------------------------------------
 # System Instructions
 # ---------------------------------------------------------------------------
 
-SYSTEM_INSTRUCTIONS = """You are **DocuForge**, an expert documentation architect and technical writer.
+SYSTEM_INSTRUCTIONS = r"""You are **DocuForge**, an expert documentation architect and technical writer.
 
-Your mission is to transform raw input content (text, PDF extracts, Markdown, and metadata about images) into beautifully structured, semantic HTML documentation.
+Your job is to convert raw input (text, PDF extracts, Markdown, image metadata) into ONE polished, semantic HTML document. Reply with the RAW HTML only — no commentary, no markdown fences, no <html>/<head>/<body> wrapper (those are added by the host).
 
-## Your Workflow
+# Document skeleton
 
-1. **Analyze** the provided content to understand its structure, topics, and key sections.
-2. **Plan** the documentation structure — decide on sections, headings, and logical flow.
-3. **Build** the documentation section by section using your tools:
-   - Use `structure_content` for EVERY section — this creates properly formatted HTML sections with anchor links.
-   - Use `format_table` when data is better presented as a table.
-   - Use `highlight_code` for any code snippets, config files, or CLI commands.
-   - Use `build_diagram` to create visual diagrams ONLY when diagrams are enabled.
-   - Use `generate_toc` as the LAST step to build the Table of Contents.
-4. **Review** the assembled output for coherence, completeness, and quality.
+Emit, in this exact order:
 
-## Rules
+1. (If a Table of Contents is requested) `<nav class="toc"><h2>Contents</h2><ul class="toc-list">…</ul></nav>`
+   - One `<li><a href="#slug">Title</a></li>` per top-level section.
+2. One `<section id="slug" class="doc-section doc-section-level-2">` per top-level section, in reading order.
+   - First child must be `<h2><a href="#slug" class="section-anchor" aria-label="Link to Title">#</a> Title</h2>`
+   - Followed by `<div class="section-content"> … rich body HTML … </div>`
+   - Sub-sections use `doc-section-level-3` and `<h3>`, etc.
+   - `slug` is lowercase-kebab-case derived from the title.
 
-1. **Always** use semantic HTML5 elements in your content (paragraphs, lists, blockquotes, etc.).
-2. **Never** invent information — only document what is provided in the input.
-3. **Structure first** — create a clear hierarchy with a Table of Contents.
-4. When the `enable_diagrams` setting is `false`, do NOT call `build_diagram`.
-5. When images are mentioned in the input metadata, note them but do NOT place them yourself — the system handles image placement separately.
-6. Write in a professional, clear, concise technical writing style.
-7. Use consistent formatting throughout the document.
-8. Make content scannable with bullet points, numbered lists, and short paragraphs.
-9. Add meaningful section titles that describe the content, not generic ones like "Section 1".
+# Rich primitives (USE THESE GENEROUSLY — they are the visual vocabulary)
+
+Callout (rule | warn | info | change | tbd):
+  <div class="callout callout-{variant}">
+    <div class="callout-title">{title}</div>
+    <div class="callout-body">{body_html}</div>
+  </div>
+
+Signal card (variant: strong | neutral | weak | info | primary | secondary; number is optional badge text):
+  <div class="signal-card signal-{variant}">
+    <div class="sig-num">{number}</div>
+    <div class="sig-title">{title}</div>
+    <div class="sig-body">{body_html}</div>
+  </div>
+
+Tag (variant: primary | secondary | strong | neutral | weak | info | warn | success | danger):
+  <span class="tag tag-{variant}">{label}</span>
+  Use inside table cells and inline prose for categorical badges (STRONG / NEUTRAL / WEAK, status labels, etc.).
+
+Principle (numbered governing row):
+  <div class="principle">
+    <div class="principle-num">{number}</div>
+    <div class="principle-body">
+      <div class="principle-title">{title}</div>
+      <div class="principle-text">{body_html}</div>
+    </div>
+  </div>
+
+Formula block:
+  <div class="formula-block">
+    {formula}
+    <div class="formula-note">{note}</div>   <!-- omit if no note -->
+  </div>
+
+Decision tree (variants: gate | check | outcome-long | outcome-short | outcome-consolidate | outcome-exit | tiebreaker):
+  <div class="tree-container">
+    <div class="tree-node gate"><strong>Start</strong><div class="tree-body">…</div></div>
+    <div class="tree-arrow">&darr;</div>
+    <div class="tree-label">if condition</div>     <!-- optional -->
+    <div class="tree-node check"><strong>Next step</strong><div class="tree-body">…</div></div>
+    …
+  </div>
+
+Table (use freely; wrap in a figure for captions):
+  <figure class="table-wrap">
+    <table class="data-table">
+      <thead><tr><th>Header A</th><th>Header B</th></tr></thead>
+      <tbody>
+        <tr><td>…</td><td><span class="tag tag-strong">STRONG</span></td></tr>
+      </tbody>
+    </table>
+    <figcaption>{caption}</figcaption>   <!-- optional -->
+  </figure>
+
+Code block (only if code highlighting is enabled — set language- class for Prism.js):
+  <figure class="code-block">
+    <div class="code-block-header">{title or language}</div>
+    <pre><code class="language-{language}">{escaped_code}</code></pre>
+  </figure>
+
+Mermaid diagram (ONLY if diagrams are enabled; types: flowchart | sequence | state | class | er):
+  <figure class="diagram diagram-{diagram_type}">
+    <pre class="mermaid">{mermaid_code}</pre>
+    <figcaption>{caption}</figcaption>   <!-- optional -->
+  </figure>
+  CRITICAL: inside `<pre class="mermaid">`, write Mermaid syntax LITERALLY. Do NOT HTML-escape it.
+  Use `-->`  NOT  `--&gt;`. Use `<` and `>` as-is in arrows and labels. Do NOT wrap the code in markdown fences.
+
+# Style rules
+
+- Mirror professional technical-spec layout: short paragraphs, scannable lists, dense tables, named principles, callouts for rules/warnings/changes, signal cards for individual concepts.
+- Use callouts: `rule` for normative statements, `warn` for cautions, `change` for changelog notes, `info` for tips, `tbd` for open items.
+- Use signal cards whenever describing one named signal / principle / topic. Number them sequentially when they form a series.
+- Use tags inside table cells and inline prose to badge categorical values.
+- Escape user-supplied text — never inject raw `<` `>` `&` from the source content into HTML attributes or text nodes; convert to entities.
+- Never invent facts. Only document what the input actually contains.
+- Diagrams: ONLY when diagrams are enabled in settings. Prefer flowchart / sequence / state.
+- Images: do NOT place them — the host application handles image placement separately.
+- Do NOT wrap the answer in markdown fences. Do NOT add commentary before or after the HTML.
+
+Plan the structure first, then write the document in one pass.
 """
 
 
 # ---------------------------------------------------------------------------
-# Task Store (in-memory for simplicity)
+# Task Store
 # ---------------------------------------------------------------------------
 
 class TaskStore:
-    """Simple in-memory store for generation tasks."""
+    """In-memory store for generation tasks."""
 
     def __init__(self) -> None:
         self._tasks: dict[str, dict] = {}
@@ -81,7 +162,6 @@ class TaskStore:
             "progress": 0.0,
             "current_step": "",
             "html_result": "",
-            "sections_html": [],
             "events": asyncio.Queue(),
         }
         self._tasks[task_id] = task
@@ -108,10 +188,7 @@ async def run_generation(
     processed_files: list[ProcessedFile],
     image_files: list[ProcessedFile],
 ) -> None:
-    """Run the documentation generation agent in background.
-
-    Sends progress events to the task's event queue for SSE streaming.
-    """
+    """Run the documentation generation agent in the background."""
     task = task_store.get(task_id)
     if not task:
         return
@@ -138,171 +215,195 @@ async def run_generation(
         await events.put(event)
         task_store.update(task_id, status=status, progress=progress, current_step=step)
 
+    ctx_token = None
     try:
-        # ----- Step 1: Send initial progress -----
         await send_progress(
             GenerationStatus.PROCESSING, 0.05,
-            "Initializing", "Setting up documentation agent..."
+            "Initializing", "Setting up documentation agent...",
         )
 
-        # ----- Step 2: Prepare input for the agent -----
-        content_parts: list[str] = []
+        # ----- 1. Assemble source content ---------------------------------
+        parts: list[str] = []
         for pf in processed_files:
-            content_parts.append(
-                f"--- File: {pf.file_info.filename} (type: {pf.file_info.file_type.value}) ---\n"
-                f"{pf.text_content}\n"
+            parts.append(
+                f"--- File: {pf.file_info.filename} "
+                f"(type: {pf.file_info.file_type.value}) ---\n{pf.text_content}\n"
             )
-
-        # Note any images that were uploaded
         if image_files:
             img_notes = "\n".join(
-                f"- Image: {img.file_info.filename} ({img.image_dimensions})"
+                f"- {img.file_info.filename} ({img.image_dimensions})"
                 for img in image_files
             )
-            content_parts.append(
+            parts.append(
                 f"\n--- Uploaded Images ---\n{img_notes}\n"
-                "Note: Images will be placed by the user via the image placement interface. "
-                "Do NOT attempt to place images yourself.\n"
+                "Note: image placement is handled by the host application.\n"
             )
-
-        combined_content = "\n\n".join(content_parts)
-
-        await send_progress(
-            GenerationStatus.PROCESSING, 0.1,
-            "Analyzing content", f"Processing {len(processed_files)} file(s)..."
-        )
-
-        # ----- Step 3: Build the prompt -----
-        settings_description = (
-            f"Document title: {request.title}\n"
-            f"Theme: {request.theme.value}\n"
-            f"Diagrams enabled: {request.enable_diagrams}\n"
-            f"Table of Contents: {request.enable_toc}\n"
-            f"Code highlighting: {request.enable_code_highlighting}\n"
-        )
-
-        if request.additional_instructions:
-            settings_description += f"Additional instructions: {request.additional_instructions}\n"
-
-        prompt = (
-            f"Generate comprehensive HTML documentation from the following content.\n\n"
-            f"## Settings\n{settings_description}\n\n"
-            f"## Source Content\n{combined_content}\n\n"
-            f"Use your tools (structure_content, format_table, highlight_code"
-            f"{', build_diagram' if request.enable_diagrams else ''}) "
-            f"to build each section. Call generate_toc at the end.\n\n"
-            f"CRITICAL INSTRUCTION: Your final output MUST be the complete, assembled HTML document (including all generated sections and the TOC) concatenated together. Do not output conversational text or markdown code blocks, just the raw HTML."
-        )
+        source_content = "\n\n".join(parts)
 
         await send_progress(
             GenerationStatus.PROCESSING, 0.15,
-            "Starting agent", "Initializing AI documentation agent..."
+            "Analysing content",
+            f"Processing {len(processed_files)} file(s) and {len(image_files)} image(s)...",
         )
 
-        # ----- Step 4: Configure and run the agent -----
-        tools = [structure_content, format_table, highlight_code, generate_toc]
-        if request.enable_diagrams:
-            tools.append(build_diagram)
+        # ----- 2. Build prompt --------------------------------------------
+        settings_block = (
+            f"Document title: {request.title}\n"
+            f"Theme: {request.theme.value}\n"
+            f"Diagrams enabled: {request.enable_diagrams}\n"
+            f"Table of contents: {request.enable_toc}\n"
+            f"Code highlighting: {request.enable_code_highlighting}\n"
+        )
+        if request.additional_instructions:
+            settings_block += f"Additional instructions: {request.additional_instructions}\n"
 
-        config = LocalAgentConfig(
-            model="gemini-3.1-pro",
-            api_key=settings.GEMINI_API_KEY,
-            system_instructions=SYSTEM_INSTRUCTIONS + "\n10. Take a deep breath and think step-by-step. Use your reasoning capabilities to carefully plan the document structure before finalizing the output.",
-            tools=tools,
-            capabilities=CapabilitiesConfig(
-                enable_subagents=True,
-            ),
+        prompt = (
+            "Build a polished HTML document from the source below.\n\n"
+            f"## Settings\n{settings_block}\n"
+            f"## Source content\n{source_content}\n\n"
+            "Emit the complete document as ONE block of raw HTML following the "
+            "skeleton and primitive patterns described in the system instructions. "
+            "No commentary. No markdown fences."
         )
 
-        async with Agent(config) as agent:
-            await send_progress(
-                GenerationStatus.PROCESSING, 0.2,
-                "Generating", "Agent is analyzing and structuring content..."
+        # ----- 3. Bind task context (kept for downstream stats) -----------
+        task_ctx = TaskContext()
+        ctx_token = set_context(task_ctx)
+
+        # ----- 4. Run the model ------------------------------------------
+        await send_progress(
+            GenerationStatus.PROCESSING, 0.25,
+            "Generating", "Gemini is writing the document...",
+        )
+
+        client = build_client()
+        config = types.GenerateContentConfig(
+            system_instruction=SYSTEM_INSTRUCTIONS,
+            temperature=0.4,
+            max_output_tokens=32768,
+        )
+
+        response = await client.aio.models.generate_content(
+            model=settings.GEMINI_MODEL,
+            contents=prompt,
+            config=config,
+        )
+
+        # Robust text extraction: walk every candidate part and concatenate
+        # text segments. `response.text` can return None when text coexists
+        # with function_call or thought parts on gemini-2.5-pro.
+        def _collect_text(resp) -> str:
+            chunks: list[str] = []
+            for cand in getattr(resp, "candidates", None) or []:
+                content = getattr(cand, "content", None)
+                for part in getattr(content, "parts", None) or []:
+                    txt = getattr(part, "text", None)
+                    if txt and not getattr(part, "thought", False):
+                        chunks.append(txt)
+            return "".join(chunks)
+
+        full_response = (response.text or _collect_text(response) or "").strip()
+
+        try:
+            finish_reason = response.candidates[0].finish_reason
+        except Exception:
+            finish_reason = None
+        print(
+            f"[orchestrator] task={task_id[:8]} finish_reason={finish_reason} "
+            f"text_len={len(full_response)}",
+            flush=True,
+        )
+
+        if not full_response:
+            raise RuntimeError(
+                f"Model returned no content (finish_reason={finish_reason}). "
+                "Check backend logs."
             )
 
-            response = await agent.chat(prompt)
-
-            # Collect the full response
-            full_response = ""
-            async for chunk in response:
-                full_response += chunk
-                # Update progress incrementally
-                progress = min(0.2 + (len(full_response) / max(len(combined_content), 1)) * 0.6, 0.85)
-                await send_progress(
-                    GenerationStatus.PROCESSING, progress,
-                    "Building documentation", "Agent is generating sections..."
-                )
-
-        await send_progress(
-            GenerationStatus.PROCESSING, 0.85,
-            "Assembling HTML", "Combining sections into final document..."
-        )
-
-        # ----- Step 5: Handle image placement prompts -----
-        if image_files:
-            for img in image_files:
-                await send_progress(
-                    GenerationStatus.AWAITING_INPUT, 0.87,
-                    "Image placement",
-                    f"Where should '{img.file_info.filename}' be placed?",
-                    image_placement=ImagePlacementInfo(
-                        image_id=img.file_info.file_id,
-                        filename=img.file_info.filename,
-                        preview_url=img.image_data or "",
-                        available_sections=[],  # Will be populated from agent state
-                    ),
-                )
-                # Wait for image placement response (with timeout)
-                # In production, this would wait for the user's placement choice
-                # For now, the frontend sends the placement via the API endpoint
-                await asyncio.sleep(0.5)
-
-        # ----- Step 6: Render final HTML -----
-        await send_progress(
-            GenerationStatus.PROCESSING, 0.9,
-            "Rendering HTML", "Applying theme and building final document..."
-        )
-
-        # Clean up markdown code blocks if the LLM wrapped the output
-        final_body = full_response.strip()
-        if final_body.startswith("```"):
-            lines = final_body.split("\n")
+        # ----- 5. Strip stray markdown fences ----------------------------
+        body = full_response
+        if body.startswith("```"):
+            lines = body.split("\n")
             if lines[0].startswith("```"):
                 lines = lines[1:]
             if lines and lines[-1].startswith("```"):
                 lines = lines[:-1]
-            final_body = "\n".join(lines)
+            body = "\n".join(lines)
 
+        # ----- 6. Derive stats from the produced HTML --------------------
+        import re as _re
+        import html as _html
+
+        # Mermaid: the model often HTML-escapes arrows (`--&gt;`, `&lt;`) inside
+        # diagram blocks, which breaks mermaid.js parsing. Un-escape the content
+        # of any element with class "mermaid".
+        def _unescape_mermaid(match: "_re.Match[str]") -> str:
+            opening, inner, closing = match.group(1), match.group(2), match.group(3)
+            return f"{opening}{_html.unescape(inner)}{closing}"
+
+        body = _re.sub(
+            r'(<(?:pre|div)[^>]*class="[^"]*\bmermaid\b[^"]*"[^>]*>)(.*?)(</(?:pre|div)>)',
+            _unescape_mermaid,
+            body,
+            flags=_re.DOTALL,
+        )
+
+        section_titles = _re.findall(
+            r'<section[^>]*class="[^"]*doc-section-level-2[^"]*"[^>]*>\s*<h2[^>]*>(?:\s*<a[^>]*>[^<]*</a>)?\s*([^<]+)',
+            body,
+        )
+        section_count = len(section_titles) or len(_re.findall(r"<section\b", body))
+        diagram_count = len(_re.findall(r'class="mermaid"', body))
+
+        await send_progress(
+            GenerationStatus.PROCESSING, 0.85,
+            "Assembling HTML",
+            f"{section_count} section(s), {diagram_count} diagram(s).",
+        )
+
+        # ----- 7. Image placement prompts (UI-driven) --------------------
+        for img in image_files:
+            await send_progress(
+                GenerationStatus.AWAITING_INPUT, 0.87,
+                "Image placement",
+                f"Where should '{img.file_info.filename}' be placed?",
+                image_placement=ImagePlacementInfo(
+                    image_id=img.file_info.file_id,
+                    filename=img.file_info.filename,
+                    preview_url=img.image_data or "",
+                    available_sections=[t.strip() for t in section_titles],
+                ),
+            )
+            await asyncio.sleep(0.1)
+
+        # ----- 8. Render final HTML with theme chrome --------------------
         doc = GeneratedDocument(
             task_id=task_id,
             title=request.title,
             theme=request.theme,
-            full_html=final_body,
-            word_count=len(final_body.split()),
-            diagram_count=final_body.count("mermaid"),
-            section_count=final_body.count("<section"),
+            full_html=body,
+            word_count=len(body.split()),
+            diagram_count=diagram_count,
+            section_count=section_count,
         )
-
         final_html = render_document(doc)
-
-        # Save the output
-        from app.services.html_renderer import save_document
-        output_filename = f"docuforge_{task_id[:8]}.html"
-        save_document(final_html, output_filename)
-
+        save_document(final_html, f"docuforge_{task_id[:8]}.html")
         task_store.update(task_id, html_result=final_html)
 
         await send_progress(
             GenerationStatus.COMPLETE, 1.0,
-            "Complete", "Documentation generated successfully!",
+            "Complete", "Documentation generated successfully.",
             html_preview=final_html,
         )
 
     except Exception as e:
         await send_progress(
             GenerationStatus.ERROR, 0.0,
-            "Error", f"Generation failed: {str(e)}"
+            "Error", f"Generation failed: {e}",
         )
+    finally:
+        if ctx_token is not None:
+            reset_context(ctx_token)
 
 
 async def stream_events(task_id: str) -> AsyncGenerator[str, None]:
@@ -313,14 +414,11 @@ async def stream_events(task_id: str) -> AsyncGenerator[str, None]:
         return
 
     events: asyncio.Queue = task["events"]
-
     while True:
         try:
             event: GenerateProgress = await asyncio.wait_for(events.get(), timeout=60.0)
             yield f"data: {event.model_dump_json()}\n\n"
-
             if event.status in (GenerationStatus.COMPLETE, GenerationStatus.ERROR):
                 break
         except asyncio.TimeoutError:
-            # Send keepalive
             yield ": keepalive\n\n"

@@ -34,3 +34,11 @@ ehthumbs.db
 backend/uploads/
 backend/output/
 *.html.out
+
+# Secrets — never commit service-account JSON or API keys
+*-service-account*.json
+*serviceaccount*.json
+gp-*-*.json
+*.pem
+*.key
+

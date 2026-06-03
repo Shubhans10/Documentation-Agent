@@ -1,65 +1,40 @@
-"""Code highlighter tool — wraps code snippets in Prism.js-compatible HTML blocks."""
-
-from __future__ import annotations
+"""Syntax-highlighted code block tool."""
 
 import html as html_lib
 
-from google.antigravity import ToolContext
+from app.agents.tool_context import get_context
 
 
-# Language aliases for Prism.js class names
 LANGUAGE_MAP: dict[str, str] = {
-    "py": "python",
-    "js": "javascript",
-    "ts": "typescript",
-    "rb": "ruby",
-    "sh": "bash",
-    "shell": "bash",
-    "yml": "yaml",
-    "md": "markdown",
-    "cs": "csharp",
-    "cpp": "cpp",
-    "c++": "cpp",
-    "objective-c": "objectivec",
-    "objc": "objectivec",
+    "py": "python", "js": "javascript", "ts": "typescript",
+    "rb": "ruby", "sh": "bash", "shell": "bash",
+    "yml": "yaml", "md": "markdown", "cs": "csharp",
+    "c++": "cpp", "objective-c": "objectivec", "objc": "objectivec",
 }
 
 
-def highlight_code(
-    code: str,
-    language: str,
-    title: str,
-    ctx: ToolContext,
-) -> str:
-    """Wraps a code snippet in syntax-highlighted HTML using Prism.js classes.
-
-    Use this tool when the content contains code snippets, configuration files,
-    CLI commands, or any technical code that benefits from syntax highlighting.
+def highlight_code(code: str, language: str, title: str = "") -> str:
+    """Wrap a code snippet in a Prism.js-compatible block.
 
     Args:
-        code: The raw code string to highlight.
-        language: The programming language (e.g. "python", "javascript", "bash",
-                  "json", "yaml", "sql", "html", "css", etc.).
-        title: A short title or filename for the code block (e.g. "main.py").
-        ctx: Tool context for state management (injected automatically).
+        code: Raw source.
+        language: Language id (``python``, ``bash``, ``json`` …).
+        title: Optional filename/title shown in the header.
     """
-    # Normalize language name
     lang = LANGUAGE_MAP.get(language.lower(), language.lower())
+    get_context().code_blocks.append({"language": lang, "title": title})
 
-    # Track code blocks
-    code_blocks = ctx.get_state("code_blocks", [])
-    code_blocks.append({"language": lang, "title": title})
-    ctx.set_state("code_blocks", code_blocks)
+    escaped = html_lib.escape(code)
+    title_html = (
+        f'<div class="code-block-header">'
+        f'<span class="code-block-title">{html_lib.escape(title)}</span>'
+        f'<span class="code-block-lang">{lang}</span>'
+        f'</div>'
+    ) if title else ""
 
-    # Escape HTML entities in the code
-    escaped_code = html_lib.escape(code)
-
-    html = f"""<div class="code-block">
-    <div class="code-block-header">
-        <span class="code-block-title">{html_lib.escape(title)}</span>
-        <span class="code-block-lang">{lang}</span>
-    </div>
-    <pre><code class="language-{lang}">{escaped_code}</code></pre>
-</div>"""
-
-    return html
+    return (
+        f'<div class="code-block">\n'
+        f'  {title_html}\n'
+        f'  <pre><code class="language-{lang}">{escaped}</code></pre>\n'
+        f'</div>'
+    )

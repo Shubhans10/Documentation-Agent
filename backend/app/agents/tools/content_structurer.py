@@ -1,82 +1,62 @@
-"""Content structurer tool — organizes content into semantic HTML5 sections with navigation."""
-
-from __future__ import annotations
+"""Content structuring + Table-of-Contents tools."""
 
 import html as html_lib
 import re
 
-from google.antigravity import ToolContext
+from app.agents.tool_context import get_context
 
 
-def structure_content(
-    title: str,
-    content_html: str,
-    level: int,
-    ctx: ToolContext,
-) -> str:
-    """Creates a structured HTML section with proper heading hierarchy.
-
-    Use this tool to organize the documentation into logical sections.
-    Call it for each major section of the document. The orchestrator should
-    call this multiple times to build the complete document structure.
-
-    Args:
-        title: The section title.
-        content_html: The HTML content for this section. Can include paragraphs,
-                      lists, blockquotes, and other HTML elements.
-        level: The heading level (2-6). Use 2 for top-level sections,
-               3 for subsections, etc.
-        ctx: Tool context for state management (injected automatically).
-    """
-    level = max(2, min(6, level))  # Clamp to valid heading levels
-
-    # Generate a URL-safe slug for the section ID
+def _slugify(title: str) -> str:
     slug = re.sub(r"[^\w\s-]", "", title.lower())
-    slug = re.sub(r"[\s_]+", "-", slug).strip("-")
-
-    # Track sections for TOC generation
-    sections = ctx.get_state("sections", [])
-    section_entry = {
-        "title": title,
-        "slug": slug,
-        "level": level,
-        "index": len(sections),
-    }
-    sections.append(section_entry)
-    ctx.set_state("sections", sections)
-
-    # Build HTML
-    html = f"""<section id="{slug}" class="doc-section doc-section-level-{level}">
-    <h{level}>
-        <a href="#{slug}" class="section-anchor" aria-label="Link to {html_lib.escape(title)}">#</a>
-        {html_lib.escape(title)}
-    </h{level}>
-    <div class="section-content">
-        {content_html}
-    </div>
-</section>"""
-
-    return html
+    return re.sub(r"[\s_]+", "-", slug).strip("-") or "section"
 
 
-def generate_toc(ctx: ToolContext) -> str:
-    """Generates a Table of Contents HTML from all structured sections.
+def structure_content(title: str, content_html: str, level: int = 2) -> str:
+    """Create a styled HTML ``<section>`` for one part of the document.
 
-    Call this AFTER all sections have been created using structure_content.
-    It reads the sections from the tool context state and builds a nested list.
+    Call this for every major section and subsection. The agent should pass
+    rich, semantic HTML in ``content_html`` (paragraphs, lists, blockquotes,
+    inline emphasis). Tables, code, diagrams, callouts, and signal cards
+    should be produced via their dedicated tools and inlined into
+    ``content_html``.
 
     Args:
-        ctx: Tool context for state management (injected automatically).
+        title: Section heading text.
+        content_html: Inner HTML for the section body.
+        level: Heading level (2-6). Use 2 for top-level sections.
     """
-    sections = ctx.get_state("sections", [])
+    level = max(2, min(6, int(level)))
+    slug = _slugify(title)
+
+    rendered = (
+        f'<section id="{slug}" class="doc-section doc-section-level-{level}">\n'
+        f'  <h{level}>'
+        f'<a href="#{slug}" class="section-anchor" aria-label="Link to {html_lib.escape(title)}">#</a> '
+        f'{html_lib.escape(title)}'
+        f'</h{level}>\n'
+        f'  <div class="section-content">\n{content_html}\n  </div>\n'
+        f'</section>'
+    )
+
+    ctx = get_context()
+    ctx.sections.append({"title": title, "slug": slug, "level": level, "html": rendered})
+
+    return rendered
+
+
+def generate_toc() -> str:
+    """Generate a nested Table-of-Contents from all previously created sections.
+
+    Call this exactly ONCE, after every ``structure_content`` call.
+    """
+    sections = get_context().sections
     if not sections:
-        return "<p>No sections found.</p>"
+        return '<p class="toc-empty">No sections found.</p>'
 
     items: list[str] = []
-    for section in sections:
-        indent = "  " * (section["level"] - 2)
+    for s in sections:
+        indent = "  " * (s["level"] - 2)
         items.append(
-            f'{indent}<li><a href="#{section["slug"]}">{html_lib.escape(section["title"])}</a></li>'
+            f'{indent}<li><a href="#{s["slug"]}">{html_lib.escape(s["title"])}</a></li>'
         )
-
-    return f'<ul class="toc-list">\n{"chr(10)".join(items)}\n</ul>'
+    return '<ul class="toc-list">\n' + "\n".join(items) + "\n</ul>"

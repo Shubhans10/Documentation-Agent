@@ -23,6 +23,7 @@ from app.models.schemas import (
     UploadResponse,
 )
 from app.services.file_processor import ProcessedFile, detect_file_type, process_file
+from app.services.llm_client import describe_auth
 
 
 # ---------------------------------------------------------------------------
@@ -76,7 +77,7 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "DocuForge API",
-        "api_key_configured": bool(settings.GEMINI_API_KEY),
+        "auth": describe_auth(),
     }
 
 
